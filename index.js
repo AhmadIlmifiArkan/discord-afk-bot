@@ -9,10 +9,38 @@ const {
   joinVoiceChannel,
   getVoiceConnection,
   VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  StreamType,
+  AudioPlayerStatus,
 } = require("@discordjs/voice");
+
+
+// ==================================================
+// CONFIGURATION
+// ==================================================
+
+const BOT_NAME = "AFUK AFK BOT";
+const VERSION = "1.0.0";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
+
+// ==================================================
+// RENDER HEALTH SERVER
+// ==================================================
+
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("AFUK AFK BOT is running.\\n");
+});
+
+healthServer.listen(PORT, "0.0.0.0", () => {
+  logInfo(`HTTP health server listening on port ${PORT}`);
 });
 
 // ==================================================
@@ -21,8 +49,50 @@ const client = new Client({
 
 const AFK_FILE = path.join(__dirname, "afk-channels.json");
 
-// Menyimpan data AFK
 const afkChannels = new Map();
+
+// Guild yang sengaja melakukan /leave
+const manualDisconnects = new Set();
+
+// Mencegah reconnect ganda
+const reconnectingGuilds = new Set();
+
+// Menyimpan audio player setiap guild
+const audioPlayers = new Map();
+
+// ==================================================
+// CONSOLE
+// ==================================================
+
+function logHeader() {
+  console.log("");
+  console.log("╔══════════════════════════════════════════════╗");
+  console.log(`║              ${BOT_NAME.padEnd(28)}║`);
+  console.log(`║              Version ${VERSION.padEnd(19)}║`);
+  console.log("╚══════════════════════════════════════════════╝");
+  console.log("");
+}
+
+function logSection(title) {
+  console.log("");
+  console.log(`┌─ ${title}`);
+}
+
+function logInfo(message) {
+  console.log(`│  ${message}`);
+}
+
+function logSuccess(message) {
+  console.log(`│  ✓ ${message}`);
+}
+
+function logWarning(message) {
+  console.log(`│  ! ${message}`);
+}
+
+function logError(message) {
+  console.log(`│  ✕ ${message}`);
+}
 
 // ==================================================
 // LOAD AFK DATA
@@ -33,8 +103,7 @@ function loadAfkChannels() {
     if (!fs.existsSync(AFK_FILE)) {
       fs.writeFileSync(AFK_FILE, JSON.stringify({}, null, 2));
 
-      console.log("📁 AFK storage created.");
-
+      logInfo("Created AFK storage file.");
       return;
     }
 
@@ -46,9 +115,10 @@ function loadAfkChannels() {
       afkChannels.set(guildId, channelId);
     }
 
-    console.log(`📁 Loaded ${afkChannels.size} AFK channel(s).`);
+    logSuccess(`Loaded ${afkChannels.size} saved AFK channel(s).`);
   } catch (error) {
-    console.error("❌ Failed to load AFK data:", error);
+    logError("Failed to load AFK data.");
+    console.error(error);
   }
 }
 
@@ -62,81 +132,157 @@ function saveAfkChannels() {
 
     fs.writeFileSync(AFK_FILE, JSON.stringify(data, null, 2));
 
-    console.log("💾 AFK data saved.");
+    logSuccess("AFK configuration saved.");
   } catch (error) {
-    console.error("❌ Failed to save AFK data:", error);
+    logError("Failed to save AFK data.");
+    console.error(error);
   }
 }
 
 // ==================================================
-// TRACKING
+// PRE-ENCODED SILENT OPUS AUDIO
 // ==================================================
 
-// Guild yang memang sengaja melakukan /leave
-const manualDisconnects = new Set();
+const SILENT_AUDIO_FILE = path.join(__dirname, "silent.opus");
 
-// Mencegah reconnect dijalankan berkali-kali
-const reconnectingGuilds = new Set();
+function startSilentAudio(guildId, connection) {
+  stopSilentAudio(guildId);
+
+  if (!fs.existsSync(SILENT_AUDIO_FILE)) {
+    throw new Error(`Missing silent audio file: ${SILENT_AUDIO_FILE}`);
+  }
+
+  const player = createAudioPlayer({
+    behaviors: {
+      maxMissedFrames: 250,
+    },
+  });
+
+  const playSilentFile = () => {
+    if (!audioPlayers.has(guildId)) return;
+
+    const stream = fs.createReadStream(SILENT_AUDIO_FILE);
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.OggOpus,
+      inlineVolume: false,
+    });
+
+    resource.playStream.on("error", (error) => {
+      logError(`Silent audio stream error | Guild ${guildId}`);
+      console.error(error);
+    });
+
+    player.play(resource);
+  };
+
+  player.on(AudioPlayerStatus.Playing, () => {
+    logSuccess(`Pre-encoded silent audio ACTIVE | Guild ${guildId}`);
+  });
+
+  player.on(AudioPlayerStatus.Idle, () => {
+    logInfo(`Silent audio file ended; restarting | Guild ${guildId}`);
+    setImmediate(playSilentFile);
+  });
+
+  player.on("error", (error) => {
+    logError(`Audio player error | Guild ${guildId}`);
+    console.error(error);
+  });
+
+  connection.subscribe(player);
+
+  audioPlayers.set(guildId, { player });
+  playSilentFile();
+
+  logInfo("Audio mode: PRE-ENCODED OPUS SILENCE");
+  logInfo("No real-time Opus encoding is performed.");
+  logInfo("Users will hear absolutely nothing.");
+}
 
 // ==================================================
-// MEMBUAT VOICE CONNECTION
+// STOP SILENT AUDIO
+// ==================================================
+
+function stopSilentAudio(guildId) {
+  const audio = audioPlayers.get(guildId);
+  if (!audio) return;
+
+  try { audio.player.stop(true); } catch (error) {}
+  audioPlayers.delete(guildId);
+  logInfo(`Silent audio stopped | Guild ${guildId}`);
+}
+
+// ==================================================
+// CREATE VOICE CONNECTION
 // ==================================================
 
 function createVoiceConnection(guild, channel) {
   const guildId = guild.id;
 
-  console.log(`🎧 Creating voice connection to ${channel.name} (${guildId})`);
+  logSection("VOICE CONNECTION");
+
+  logInfo(`Guild   : ${guild.name}`);
+  logInfo(`Channel : ${channel.name}`);
+  logInfo(`Guild ID: ${guildId}`);
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
     guildId: guildId,
     adapterCreator: guild.voiceAdapterCreator,
+
+    // Bot does not need to receive audio.
     selfDeaf: true,
-    selfMute: true,
+
+    // IMPORTANT:
+    // We are transmitting silent audio.
+    selfMute: false,
   });
 
   // ==============================================
-  // CONNECTION READY
+  // READY
   // ==============================================
 
   connection.on(VoiceConnectionStatus.Ready, () => {
-    console.log(`✅ Voice connection READY | Guild ${guildId}`);
+    logSection("VOICE READY");
+
+    logSuccess(`Connected to ${channel.name}`);
+
+    logSuccess("Pre-encoded silent audio transmission started.");
 
     reconnectingGuilds.delete(guildId);
+
+    startSilentAudio(guildId, connection);
   });
 
   // ==============================================
-  // CONNECTION DISCONNECTED
+  // DISCONNECTED
   // ==============================================
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    console.log(`⚠️ Voice connection DISCONNECTED | Guild ${guildId}`);
+    logSection("VOICE DISCONNECTED");
 
-    // ------------------------------------------
-    // Jika disconnect karena /leave
-    // ------------------------------------------
+    logWarning(`Connection lost | Guild ${guildId}`);
 
+    stopSilentAudio(guildId);
+
+    // Intentional /leave
     if (manualDisconnects.has(guildId)) {
-      console.log(`ℹ️ Disconnect was intentional | Guild ${guildId}`);
+      logInfo("Disconnect was intentional.");
 
       return;
     }
 
-    // ------------------------------------------
-    // Jika reconnect sedang berjalan
-    // ------------------------------------------
-
+    // Reconnect already running
     if (reconnectingGuilds.has(guildId)) {
-      console.log(`ℹ️ Reconnect is already in progress | Guild ${guildId}`);
+      logInfo("Reconnect process already running.");
 
       return;
     }
 
     reconnectingGuilds.add(guildId);
 
-    console.log(`🔄 Starting reconnect process | Guild ${guildId}`);
+    logInfo("Starting automatic reconnect...");
 
-    // Tunggu 2 detik
     await new Promise((resolve) => {
       setTimeout(resolve, 2000);
     });
@@ -145,21 +291,17 @@ function createVoiceConnection(guild, channel) {
       const currentGuild = client.guilds.cache.get(guildId);
 
       if (!currentGuild) {
-        console.log(`❌ Guild not found | ${guildId}`);
+        logError(`Guild not found | ${guildId}`);
 
         reconnectingGuilds.delete(guildId);
 
         return;
       }
 
-      // ------------------------------------------
-      // Ambil channel dari storage
-      // ------------------------------------------
-
       const channelId = afkChannels.get(guildId);
 
       if (!channelId) {
-        console.log(`❌ No reconnect channel is stored | Guild ${guildId}`);
+        logError("No saved AFK channel found.");
 
         reconnectingGuilds.delete(guildId);
 
@@ -169,28 +311,31 @@ function createVoiceConnection(guild, channel) {
       const currentChannel = currentGuild.channels.cache.get(channelId);
 
       if (!currentChannel) {
-        console.log(`❌ Voice channel not found | Channel ${channelId}`);
+        logError(`Voice channel not found | ${channelId}`);
 
         reconnectingGuilds.delete(guildId);
 
         return;
       }
 
-      console.log(`🔄 Creating new connection to ${currentChannel.name}`);
+      logInfo(`Reconnecting to ${currentChannel.name}...`);
 
-      // Hancurkan connection lama
       const oldConnection = getVoiceConnection(guildId);
 
       if (oldConnection) {
+        stopSilentAudio(guildId);
         oldConnection.destroy();
       }
 
-      // Buat connection baru
+      manualDisconnects.delete(guildId);
+
       createVoiceConnection(currentGuild, currentChannel);
 
-      console.log(`✅ New connection created | Guild ${guildId}`);
+      logSuccess("Reconnect initiated successfully.");
     } catch (error) {
-      console.error(`❌ Reconnect failed | Guild ${guildId}`, error);
+      logError(`Reconnect failed | Guild ${guildId}`);
+
+      console.error(error);
 
       reconnectingGuilds.delete(guildId);
     }
@@ -204,16 +349,22 @@ function createVoiceConnection(guild, channel) {
 // ==================================================
 
 async function restoreAfkConnections() {
-  console.log("=================================");
-  console.log("🔄 Restoring AFK connections...");
-  console.log("=================================");
+  logSection("AFK RESTORE");
+
+  if (afkChannels.size === 0) {
+    logInfo("No saved AFK connections found.");
+
+    return;
+  }
+
+  logInfo(`Restoring ${afkChannels.size} AFK connection(s)...`);
 
   for (const [guildId, channelId] of afkChannels) {
     try {
       const guild = client.guilds.cache.get(guildId);
 
       if (!guild) {
-        console.log(`⚠️ Guild not found | ${guildId}`);
+        logWarning(`Guild unavailable | ${guildId}`);
 
         continue;
       }
@@ -221,16 +372,17 @@ async function restoreAfkConnections() {
       const channel = guild.channels.cache.get(channelId);
 
       if (!channel) {
-        console.log(`⚠️ Voice channel not found | ${channelId}`);
+        logWarning(`Voice channel unavailable | ${channelId}`);
 
         continue;
       }
 
-      console.log(`🔄 Rejoining ${channel.name} | Guild ${guildId}`);
+      logInfo(`Restoring ${guild.name} → ${channel.name}`);
 
       const existingConnection = getVoiceConnection(guildId);
 
       if (existingConnection) {
+        stopSilentAudio(guildId);
         existingConnection.destroy();
       }
 
@@ -238,7 +390,9 @@ async function restoreAfkConnections() {
 
       createVoiceConnection(guild, channel);
     } catch (error) {
-      console.error(`❌ Failed to restore guild ${guildId}:`, error);
+      logError(`Failed to restore guild ${guildId}`);
+
+      console.error(error);
     }
   }
 }
@@ -248,20 +402,41 @@ async function restoreAfkConnections() {
 // ==================================================
 
 client.once(Events.ClientReady, async () => {
-  console.log("=================================");
-  console.log(`BOT ONLINE: ${client.user.tag}`);
-  console.log("=================================");
+  logHeader();
 
-  // Load data dari file
+  console.log(`✓ Logged in as ${client.user.tag}`);
+
+  console.log(`✓ Bot ID      : ${client.user.id}`);
+
+  console.log(`✓ Guilds      : ${client.guilds.cache.size}`);
+
+  console.log("✓ Voice mode   : Persistent AFK");
+
+  console.log("✓ Audio mode   : Pre-encoded Opus silence");
+
+  console.log("");
+
   loadAfkChannels();
 
-  // Tunggu sebentar agar guild/channel cache siap
   await new Promise((resolve) => {
     setTimeout(resolve, 2000);
   });
 
-  // Restore semua AFK connection
   await restoreAfkConnections();
+
+  logSection("SYSTEM READY");
+
+  logSuccess("AFUK AFK BOT is ready.");
+
+  logInfo("Use /join to enter a voice channel.");
+
+  logInfo("Use /leave to disconnect.");
+
+  logInfo("Use /status to check the current state.");
+
+  logInfo("Use /testdisconnect to test recovery.");
+
+  console.log("");
 });
 
 // ==================================================
@@ -269,17 +444,19 @@ client.once(Events.ClientReady, async () => {
 // ==================================================
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  console.log("INTERACTION RECEIVED:");
-  console.log("Command:", interaction.commandName);
-  console.log("Guild:", interaction.guildId);
-
   if (!interaction.isChatInputCommand()) {
     return;
   }
 
-  // ==========================================
+  const guildId = interaction.guildId;
+
+  console.log(
+    `\n[COMMAND] /${interaction.commandName} | ${interaction.guild?.name || guildId}`,
+  );
+
+  // ============================================
   // /JOIN
-  // ==========================================
+  // ============================================
 
   if (interaction.commandName === "join") {
     const voiceChannel = interaction.member.voice.channel;
@@ -290,15 +467,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    const guildId = interaction.guildId;
-
-    // Hapus status disconnect manual
     manualDisconnects.delete(guildId);
 
-    // Simpan channel tujuan
     afkChannels.set(guildId, voiceChannel.id);
 
-    // Simpan ke file
     saveAfkChannels();
 
     const existingConnection = getVoiceConnection(guildId);
@@ -313,10 +485,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       createVoiceConnection(interaction.guild, voiceChannel);
 
       await interaction.reply(
-        `🎧 Successfully joined **${voiceChannel.name}**.`,
+        `🎧 Successfully joined **${voiceChannel.name}**.\n🔇 Silent mode is active.`,
       );
     } catch (error) {
-      console.error("❌ Error while joining voice channel:", error);
+      logError("Failed to join voice channel.");
+
+      console.error(error);
 
       await interaction.reply({
         content: "❌ Failed to join the voice channel.",
@@ -327,13 +501,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ==========================================
+  // ============================================
   // /LEAVE
-  // ==========================================
+  // ============================================
 
   if (interaction.commandName === "leave") {
-    const guildId = interaction.guildId;
-
     const connection = getVoiceConnection(guildId);
 
     if (!connection) {
@@ -344,35 +516,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Tandai sebagai disconnect manual
     manualDisconnects.add(guildId);
-
-    // Hentikan reconnect
     reconnectingGuilds.delete(guildId);
 
-    // Hapus AFK channel dari memory
     afkChannels.delete(guildId);
 
-    // Hapus AFK channel dari file
     saveAfkChannels();
 
-    // Disconnect
+    stopSilentAudio(guildId);
+
     connection.destroy();
 
-    console.log(`👋 Bot left the voice channel | Guild ${guildId}`);
+    logSection("AFK SESSION CLOSED");
+
+    logSuccess(`Disconnected from ${interaction.guild.name}`);
 
     await interaction.reply("👋 Bot has left the voice channel.");
 
     return;
   }
 
-  // ==========================================
+  // ============================================
   // /TESTDISCONNECT
-  // ==========================================
+  // ============================================
 
   if (interaction.commandName === "testdisconnect") {
-    const guildId = interaction.guildId;
-
     const connection = getVoiceConnection(guildId);
 
     if (!connection) {
@@ -399,29 +567,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Pastikan disconnect dianggap
-    // sebagai disconnect yang harus direconnect
     manualDisconnects.delete(guildId);
 
-    await interaction.reply("🧪 Simulating a voice connection disconnect...");
+    await interaction.reply(
+      "🧪 Testing voice recovery. The bot will reconnect automatically.",
+    );
 
-    console.log("=================================");
-    console.log(`🧪 TEST DISCONNECT | Guild ${guildId}`);
-    console.log(`🎧 Channel: ${channel.name}`);
-    console.log("=================================");
+    logSection("RECOVERY TEST");
+
+    logInfo(`Guild   : ${interaction.guild.name}`);
+
+    logInfo(`Channel : ${channel.name}`);
+
+    logInfo("Simulating voice connection loss...");
 
     connection.disconnect();
 
     return;
   }
 
-  // ==========================================
+  // ============================================
   // /STATUS
-  // ==========================================
+  // ============================================
 
   if (interaction.commandName === "status") {
-    const guildId = interaction.guildId;
-
     const connection = getVoiceConnection(guildId);
 
     if (!connection) {
@@ -434,7 +603,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     let channel = interaction.guild.members.me?.voice?.channel;
 
-    // Fallback menggunakan storage
     if (!channel) {
       const channelId = afkChannels.get(guildId);
 
@@ -443,10 +611,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
+    const audio = audioPlayers.get(guildId);
+
+    const audioStatus = audio ? audio.player.state.status : "Not active";
+
     await interaction.reply(
       `🟢 **ONLINE**\n` +
-        `📡 Status: \`${connection.state.status}\`\n` +
-        `🎧 Channel: **${channel ? channel.name : "Unknown"}**`,
+        `📡 Connection: \`${connection.state.status}\`\n` +
+        `🎧 Channel: **${channel ? channel.name : "Unknown"}**\n` +
+        `🔇 Audio: **Pre-encoded Opus silence**\n` +
+        `🎵 Stream: \`${audioStatus}\``,
     );
 
     return;
@@ -454,7 +628,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ==================================================
+// PROCESS ERROR HANDLING
+// ==================================================
+
+process.on("unhandledRejection", (error) => {
+  logError("Unhandled promise rejection.");
+  console.error(error);
+});
+
+process.on("uncaughtException", (error) => {
+  logError("Uncaught exception.");
+  console.error(error);
+});
+
+// ==================================================
 // START BOT
 // ==================================================
+
+logSection("STARTUP");
+
+logInfo("Starting Discord connection...");
 
 client.login(process.env.DISCORD_TOKEN);

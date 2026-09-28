@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: afuk-afk-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: GUILD_ID
+        sync: false
